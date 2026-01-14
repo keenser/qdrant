@@ -98,7 +98,7 @@ pub fn init(
             api_key_whitelist.push(WhitelistItem::prefix(WEB_UI_PATH));
         }
 
-        let api_key_blacklist = Blacklist::try_from(settings.service.jwt_blacklist.as_deref())?;
+        let api_key_blacklist = Blacklist::try_from(settings.service.jwt_blacklist.as_ref())?;
 
         let mut server = HttpServer::new(move || {
             let cors = Cors::default()

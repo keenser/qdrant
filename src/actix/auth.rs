@@ -14,6 +14,7 @@ use storage::rbac::{Access, AccessRequirements, CollectionMultipass};
 use super::forwarded;
 use super::helpers::HttpError;
 use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
+use crate::settings::BlacklistConfig;
 
 /// Actix middleware factory that validates API keys / JWTs and inserts an
 /// [`Auth`] object into request extensions.
@@ -130,15 +131,38 @@ impl Blacklist {
     }
 }
 
-impl TryFrom<Option<&str>> for Blacklist {
+impl TryFrom<HashMap<String, HashSet<String>>> for Blacklist {
     type Error = std::io::Error;
 
-    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
+    fn try_from(val: HashMap<String, HashSet<String>>) -> Result<Self, Self::Error> {
         let mut blacklist = HashMap::new();
 
-        if let Some(blacklist_str) = value
-            && !blacklist_str.is_empty()
-        {
+        for (method_str, paths) in val.into_iter() {
+            let method =
+                Method::from_bytes(method_str.to_uppercase().as_bytes()).map_err(|_| {
+                    Self::Error::other(format!(
+                        "Provided invalid method for a blacklist: {method_str}"
+                    ))
+                })?;
+
+            blacklist.insert(method, paths);
+        }
+
+        Ok(Self(blacklist))
+    }
+}
+
+impl TryFrom<&str> for Blacklist {
+    type Error = std::io::Error;
+
+    fn try_from(blacklist_str: &str) -> Result<Self, Self::Error> {
+        if let Ok(json) = serde_json::from_str::<HashMap<String, HashSet<String>>>(blacklist_str) {
+            return Self::try_from(json);
+        }
+
+        let mut blacklist = HashMap::new();
+
+        if !blacklist_str.is_empty() {
             for pair in blacklist_str.trim().split(',') {
                 let mut pair_iter = pair.trim().split(' ');
 
@@ -147,11 +171,12 @@ impl TryFrom<Option<&str>> for Blacklist {
                         "No method provided for a blacklist item",
                     ));
                 };
-                let method = Method::from_bytes(method_str.trim().as_bytes()).map_err(|_| {
-                    Self::Error::other(format!(
-                        "Provided invalid method for a blacklist: {method_str}"
-                    ))
-                })?;
+                let method = Method::from_bytes(method_str.trim().to_uppercase().as_bytes())
+                    .map_err(|_| {
+                        Self::Error::other(format!(
+                            "Provided invalid method for a blacklist: {method_str}"
+                        ))
+                    })?;
 
                 let Some(path_str) = pair_iter.next() else {
                     return Err(Self::Error::other("No path provided for a blacklist item"));
@@ -174,7 +199,22 @@ impl TryFrom<Option<&str>> for Blacklist {
             }
         };
 
-        Ok(Blacklist(blacklist))
+        Ok(Self(blacklist))
+    }
+}
+
+impl TryFrom<Option<&BlacklistConfig>> for Blacklist {
+    type Error = std::io::Error;
+
+    fn try_from(config: Option<&BlacklistConfig>) -> Result<Self, Self::Error> {
+        let Some(config) = config else {
+            return Ok(Self(Default::default()));
+        };
+
+        match config {
+            BlacklistConfig::Raw(s) => Self::try_from(s.as_str()),
+            BlacklistConfig::Parsed(val) => Self::try_from(val.clone()),
+        }
     }
 }
 
@@ -359,10 +399,66 @@ mod tests {
 
     #[test]
     fn test_blacklist_parsing() {
-        let blacklist = Blacklist::try_from(None).unwrap().into_inner();
+        let blacklist = Blacklist::try_from("").unwrap().into_inner();
         assert!(blacklist.is_empty());
 
-        let blacklist = Blacklist::try_from(Some("")).unwrap().into_inner();
-        assert!(blacklist.is_empty());
+        let blacklist = Blacklist::try_from(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover",
+        )
+        .unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let blacklist = Blacklist::try_from(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = BlacklistConfig::Raw(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover"
+                .to_string(),
+        );
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = BlacklistConfig::Raw(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#.to_string());
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let map = serde_json::from_str::<HashMap<String, HashSet<String>>>(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        let config = BlacklistConfig::Parsed(map);
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = serde_json::from_str::<BlacklistConfig>(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
     }
 }
