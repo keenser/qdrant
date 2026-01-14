@@ -71,7 +71,10 @@ where
 
     let headers = req.headers();
     let (access, inference_token, auth_type, subject) = auth_keys
-        .validate_request(move |key| headers.get(key).and_then(|val| val.to_str().ok()))
+        .validate_request(
+            move |key| headers.get(key).and_then(|val| val.to_str().ok()),
+            Default::default(),
+        )
         .await
         .map_err(|e| {
             log_denied_auth(path, remote.clone(), tracing_id.clone(), &e);

@@ -141,14 +141,26 @@ impl AuthKeys {
     pub async fn validate_request<'a>(
         &self,
         get_header: impl Fn(&'a str) -> Option<&'a str>,
+        blacklist_matches: bool,
     ) -> Result<(Access, InferenceToken, AuthType, Option<String>), AuthError> {
-        let Some(key) = get_header(HTTP_HEADER_API_KEY)
-            .or_else(|| get_header("authorization").and_then(|v| v.strip_prefix("Bearer ")))
+        let Some((key, api_key_provided)) = get_header(HTTP_HEADER_API_KEY)
+            .map(|s| (s, true))
+            .or_else(|| {
+                get_header("authorization")
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .map(|s| (s, false))
+            })
         else {
             return Err(AuthError::Unauthorized(
                 "Must provide an API key or an Authorization bearer token".to_string(),
             ));
         };
+
+        if !api_key_provided && blacklist_matches {
+            return Err(AuthError::Forbidden(
+                "This path is blacklisted by config".to_string(),
+            ));
+        }
 
         if self.can_write(key) {
             return Ok((

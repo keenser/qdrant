@@ -62,6 +62,8 @@ pub struct ServiceConfig {
     pub read_only_api_key: Option<String>,
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
+    #[serde(default)]
+    pub jwt_blacklist: Option<String>,
 
     /// Enforce API key / JWT authentication on the internal (p2p) gRPC API.
     ///

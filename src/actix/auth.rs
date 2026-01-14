@@ -1,9 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use actix_web::body::EitherBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready};
+use actix_web::http::Method;
 use actix_web::{Error, FromRequest, HttpMessage, HttpResponse, ResponseError};
 use futures_util::future::LocalBoxFuture;
 use storage::audit::{audit_trust_forwarded_headers, extract_tracing_id};
@@ -21,13 +23,15 @@ use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
 pub struct AuthTransform {
     auth_keys: AuthKeys,
     whitelist: Vec<WhitelistItem>,
+    blacklist: Blacklist,
 }
 
 impl AuthTransform {
-    pub fn new(auth_keys: AuthKeys, whitelist: Vec<WhitelistItem>) -> Self {
+    pub fn new(auth_keys: AuthKeys, whitelist: Vec<WhitelistItem>, blacklist: Blacklist) -> Self {
         Self {
             auth_keys,
             whitelist,
+            blacklist,
         }
     }
 }
@@ -48,6 +52,7 @@ where
         ready(Ok(AuthMiddleware {
             auth_keys: Arc::new(self.auth_keys.clone()),
             whitelist: self.whitelist.clone(),
+            blacklist: self.blacklist.clone(),
             service: Arc::new(service),
         }))
     }
@@ -87,10 +92,98 @@ impl PathMode {
     }
 }
 
+#[derive(Clone)]
+pub struct Blacklist(HashMap<Method, HashSet<String>>);
+
+impl Blacklist {
+    pub fn matches(&self, method: &Method, path: &str) -> bool {
+        let Some(paths) = self.0.get(method) else {
+            return false;
+        };
+
+        paths.iter().any(|path_str| {
+            let mut blacklist_iter = path_str.split('/');
+            let mut passed_iter = path.split('/');
+
+            loop {
+                match blacklist_iter.next() {
+                    Some(blacklist_part) => match passed_iter.next() {
+                        Some(passed_part) => {
+                            if blacklist_part != passed_part && blacklist_part != "*" {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    },
+                    None => match passed_iter.next() {
+                        Some(_passed_part) => return false,
+                        None => return true,
+                    },
+                };
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> HashMap<Method, HashSet<String>> {
+        self.0
+    }
+}
+
+impl TryFrom<Option<&str>> for Blacklist {
+    type Error = std::io::Error;
+
+    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
+        let mut blacklist = HashMap::new();
+
+        if let Some(blacklist_str) = value
+            && !blacklist_str.is_empty()
+        {
+            for pair in blacklist_str.trim().split(',') {
+                let mut pair_iter = pair.trim().split(' ');
+
+                let Some(method_str) = pair_iter.next() else {
+                    return Err(Self::Error::other(
+                        "No method provided for a blacklist item",
+                    ));
+                };
+                let method = Method::from_bytes(method_str.trim().as_bytes()).map_err(|_| {
+                    Self::Error::other(format!(
+                        "Provided invalid method for a blacklist: {method_str}"
+                    ))
+                })?;
+
+                let Some(path_str) = pair_iter.next() else {
+                    return Err(Self::Error::other("No path provided for a blacklist item"));
+                };
+                if pair_iter.next().is_some() {
+                    return Err(Self::Error::other(
+                        "Provided extra parts for a blacklist item",
+                    ));
+                }
+
+                match blacklist.get_mut(&method) {
+                    None => {
+                        let paths = HashSet::from([path_str.trim().to_string()]);
+                        blacklist.insert(method, paths);
+                    }
+                    Some(paths) => {
+                        paths.insert(path_str.trim().to_string());
+                    }
+                };
+            }
+        };
+
+        Ok(Blacklist(blacklist))
+    }
+}
+
 pub struct AuthMiddleware<S> {
     auth_keys: Arc<AuthKeys>,
     /// List of items whitelisted from authentication.
     whitelist: Vec<WhitelistItem>,
+    /// List of items blackisted for JWT authentication by configuration.
+    blacklist: Blacklist,
     service: Arc<S>,
 }
 
@@ -126,6 +219,8 @@ where
 
         let auth_keys = self.auth_keys.clone();
         let service = self.service.clone();
+        let path = req.path().to_string();
+        let blacklist_matches = self.blacklist.matches(req.method(), &path);
         Box::pin(async move {
             let remote = if audit_trust_forwarded_headers() {
                 forwarded::forwarded_for(&req)
@@ -142,7 +237,10 @@ where
             });
 
             match auth_keys
-                .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
+                .validate_request(
+                    |key| req.headers().get(key).and_then(|val| val.to_str().ok()),
+                    blacklist_matches,
+                )
                 .await
             {
                 Ok((access, inference_token, auth_type, subject)) => {
@@ -252,5 +350,19 @@ impl FromRequest for ActixAccessManage {
             Ok(multipass) => ready(Ok(Self { auth, multipass })),
             Err(err) => ready(Err(HttpError::from(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blacklist_parsing() {
+        let blacklist = Blacklist::try_from(None).unwrap().into_inner();
+        assert!(blacklist.is_empty());
+
+        let blacklist = Blacklist::try_from(Some("")).unwrap().into_inner();
+        assert!(blacklist.is_empty());
     }
 }
