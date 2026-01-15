@@ -137,7 +137,7 @@ impl TryFrom<HashMap<String, HashSet<String>>> for Blacklist {
     fn try_from(val: HashMap<String, HashSet<String>>) -> Result<Self, Self::Error> {
         let mut blacklist = HashMap::new();
 
-        for (method_str, paths) in val.into_iter() {
+        for (method_str, paths) in val {
             let method =
                 Method::from_bytes(method_str.to_uppercase().as_bytes()).map_err(|_| {
                     Self::Error::other(format!(
