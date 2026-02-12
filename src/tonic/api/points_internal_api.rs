@@ -53,6 +53,10 @@ pub struct PointsInternalService {
 
 impl PointsInternalService {
     pub fn new(toc: Arc<TableOfContent>, service_config: ServiceConfig) -> Self {
+        println!(
+            "PointsInternalService::new blacklist: {:#?}",
+            service_config.jwt_blacklist
+        );
         Self {
             toc,
             service_config,
