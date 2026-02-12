@@ -125,6 +125,7 @@ impl Blacklist {
         });
 
         println!("method: {method}, path: {path}, matches: {m}");
+        println!("Blacklist: {self:#?}");
 
         m
     }
