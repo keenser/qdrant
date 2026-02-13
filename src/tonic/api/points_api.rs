@@ -39,7 +39,7 @@ pub struct PointsService {
 
 impl PointsService {
     pub fn new(dispatcher: Arc<Dispatcher>, service_config: ServiceConfig) -> Self {
-        println!(
+        log::info!(
             "PointsService::new blacklist: {:#?}",
             service_config.jwt_blacklist
         );
