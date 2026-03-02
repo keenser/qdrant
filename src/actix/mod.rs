@@ -99,7 +99,6 @@ pub fn init(
         }
 
         let api_key_blacklist = Blacklist::try_from(settings.service.jwt_blacklist.as_ref())?;
-        log::info!("api_key_blacklist: {api_key_blacklist:#?}");
 
         let mut server = HttpServer::new(move || {
             let cors = Cors::default()

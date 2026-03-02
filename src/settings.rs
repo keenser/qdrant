@@ -340,10 +340,6 @@ impl Settings {
 
         // Build and merge config and deserialize into Settings, attach any load errors we had
         let mut settings: Settings = config.build()?.try_deserialize()?;
-        log::info!(
-            "Settings::new blacklist: {:#?}",
-            settings.service.jwt_blacklist
-        );
         settings.load_errors.extend(load_errors);
         Ok(settings)
     }

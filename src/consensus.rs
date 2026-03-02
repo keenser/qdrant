@@ -88,10 +88,6 @@ impl Consensus {
         runtime: Handle,
         reinit: bool,
     ) -> anyhow::Result<JoinHandle<std::io::Result<()>>> {
-        log::info!(
-            "Consensus::run blacklist: {:#?}",
-            settings.service.jwt_blacklist
-        );
         let tls_client_config = helpers::load_tls_client_config(&settings)?;
 
         let p2p_host = settings.service.host.clone();
