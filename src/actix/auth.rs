@@ -13,7 +13,7 @@ use storage::rbac::{Access, AccessRequirements, CollectionMultipass};
 
 use super::forwarded;
 use super::helpers::HttpError;
-use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
+use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType};
 use crate::settings::BlacklistConfig;
 
 /// Actix middleware factory that validates API keys / JWTs and inserts an
@@ -259,8 +259,8 @@ where
 
         let auth_keys = self.auth_keys.clone();
         let service = self.service.clone();
-        let path = req.path().to_string();
-        let blacklist_matches = self.blacklist.matches(req.method(), &path);
+        let path = req.path();
+        let blacklist_matches = self.blacklist.matches(req.method(), path);
         Box::pin(async move {
             let remote = if audit_trust_forwarded_headers() {
                 forwarded::forwarded_for(&req)
@@ -296,7 +296,6 @@ where
                     service.call(req).await
                 }
                 Err(e) => {
-                    log_denied_auth(req.path(), remote.clone(), tracing_id, &e);
                     let resp = match e {
                         AuthError::Unauthorized(e) => HttpResponse::Unauthorized().body(e),
                         AuthError::Forbidden(e) => HttpResponse::Forbidden().body(e),
@@ -390,6 +389,76 @@ impl FromRequest for ActixAccessManage {
             Ok(multipass) => ready(Ok(Self { auth, multipass })),
             Err(err) => ready(Err(HttpError::from(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blacklist_parsing() {
+        let blacklist = Blacklist::try_from("").unwrap().into_inner();
+        assert!(blacklist.is_empty());
+
+        let blacklist = Blacklist::try_from(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover",
+        )
+        .unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let blacklist = Blacklist::try_from(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = BlacklistConfig::Raw(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover"
+                .to_string(),
+        );
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = BlacklistConfig::Raw(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#.to_string());
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let map = serde_json::from_str::<HashMap<String, HashSet<String>>>(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        let config = BlacklistConfig::Parsed(map);
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = serde_json::from_str::<BlacklistConfig>(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
     }
 }
 
