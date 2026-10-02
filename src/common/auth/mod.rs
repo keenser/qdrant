@@ -226,13 +226,17 @@ impl AuthKeys {
         // introspect it against the IAM `/oauth2/introspect` endpoint.
         if let Some(iam) = &self.iam {
             match iam.validate(key).await {
-                Ok(access) => {
+                Ok((access, identity)) => {
                     if blacklist_matches {
                         return Err(AuthError::Forbidden(
                             "This path is blacklisted by config".to_string(),
                         ));
                     }
-                    return Ok((access, InferenceToken(None), AuthType::OpaqueToken, None));
+                    // Log the OAuth2 client that owns the token as the audit
+                    // subject, so every DB operation performed with this opaque
+                    // token is attributable to a specific client_id.
+                    let subject = Some(identity.client_id);
+                    return Ok((access, InferenceToken(None), AuthType::OpaqueToken, subject));
                 }
                 Err(IamError::Inactive) | Err(IamError::UntrustedAudience) => {
                     return Err(AuthError::Unauthorized("Invalid opaque token".to_string()));
@@ -468,7 +472,8 @@ mod tests {
         });
 
         assert_eq!(auth_type, AuthType::OpaqueToken);
-        assert_eq!(subject, None);
+        // The OAuth2 client_id from the introspection is used as the audit subject.
+        assert_eq!(subject.as_deref(), Some("qdrant"));
         // qdrant:read -> global read-only
         assert_eq!(access, Access::full_ro("IAM scope qdrant:read"));
         mock.assert();

@@ -78,6 +78,17 @@ impl IntrospectionResult {
     }
 }
 
+/// Identity metadata extracted from an introspection result, used for audit
+/// logging. Carries the OAuth2 `client_id` (the service/app that requested the
+/// token) and, when present, the `sub` (resource owner).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IamIdentity {
+    /// The OAuth2 client that requested the token.
+    pub client_id: String,
+    /// The resource owner subject, if provided by the token.
+    pub sub: Option<String>,
+}
+
 /// A client that introspects opaque bearer tokens against Spirit IAM
 /// (Ory Hydra `/oauth2/introspect`).
 #[derive(Clone)]
@@ -197,12 +208,13 @@ impl IamClient {
         Ok(result)
     }
 
-    /// Map an introspection result to Qdrant [`Access`] rights based on the
-    /// granted scopes.
+    /// Introspect an opaque token and map the granted scopes to Qdrant
+    /// [`Access`] rights, together with the identity metadata used for audit
+    /// logging.
     ///
-    /// Returns `None` if the token is not active, its audience is not trusted,
+    /// Returns an error if the token is not active, its audience is not trusted,
     /// or it grants no recognized Qdrant scope.
-    pub async fn validate(&self, token: &str) -> Result<Access, IamError> {
+    pub async fn validate(&self, token: &str) -> Result<(Access, IamIdentity), IamError> {
         let result = self.introspect(token).await?;
 
         if !result.active {
@@ -217,7 +229,13 @@ impl IamClient {
             }
         }
 
-        access_from_scopes(&result.scopes()).ok_or(IamError::Inactive)
+        let access = access_from_scopes(&result.scopes()).ok_or(IamError::Inactive)?;
+        let identity = IamIdentity {
+            client_id: result.client_id.unwrap_or_default(),
+            sub: result.sub.clone(),
+        };
+
+        Ok((access, identity))
     }
 
     async fn introspect_remote(&self, token: &str) -> Result<IntrospectionResult, IamError> {
@@ -368,10 +386,18 @@ mod tests {
         match access {
             Access::Collection(list) => {
                 assert_eq!(list.0.len(), 2);
-                assert_eq!(list.0[0].collection, "products");
-                assert_eq!(list.0[0].access, CollectionAccessMode::Read);
-                assert_eq!(list.0[1].collection, "orders");
-                assert_eq!(list.0[1].access, CollectionAccessMode::ReadWrite);
+                // HashSet iteration order is non-deterministic, so look up each
+                // collection by name rather than relying on list order.
+                let by_name: HashMap<_, _> = list
+                    .0
+                    .iter()
+                    .map(|c| (c.collection.as_str(), c.access))
+                    .collect();
+                assert_eq!(by_name.get("products"), Some(&CollectionAccessMode::Read));
+                assert_eq!(
+                    by_name.get("orders"),
+                    Some(&CollectionAccessMode::ReadWrite)
+                );
             }
             _ => panic!("expected collection access"),
         }
@@ -428,7 +454,7 @@ mod tests {
         };
         let client = IamClient::new(&config);
 
-        let access = client.validate("opaque-token").await.unwrap();
+        let (access, identity) = client.validate("opaque-token").await.unwrap();
         match access {
             Access::Collection(list) => {
                 assert_eq!(list.0.len(), 1);
@@ -437,6 +463,8 @@ mod tests {
             }
             _ => panic!("expected collection access"),
         }
+        assert_eq!(identity.client_id, "qdrant");
+        assert_eq!(identity.sub.as_deref(), Some("user-1"));
 
         mock.assert_async().await;
     }
