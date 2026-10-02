@@ -318,7 +318,7 @@ dashmap = "6.2"
 walkdir = "2.5.0"
 
 [patch.crates-io]
-tonic = { git = "https://github.com/qdrant/tonic", branch = "v0.14.6-qdrant" }
+tonic = { git = "https://github.com/keenser/tonic", branch = "v0.14.6-qdrant" }
 
 [[bin]]
 name = "schema_generator"

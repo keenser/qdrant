@@ -8353,7 +8353,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 [[package]]
 name = "tonic"
 version = "0.14.6"
-source = "git+https://github.com/qdrant/tonic?branch=v0.14.6-qdrant#a40343f9359c4380fa8fe7c10f8c8b9f4d8a8e08"
+source = "git+https://github.com/keenser/tonic?branch=v0.14.6-qdrant#8488ae5ef6b507278caf90a4ab689db5b3456c59"
 dependencies = [
  "async-trait",
  "axum",

@@ -18,7 +18,7 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// A TTL based rotating server certificate resolver
 #[derive(Debug)]
-struct RotatingCertificateResolver {
+pub struct RotatingCertificateResolver {
     /// TLS configuration used for loading/refreshing certified key
     tls_config: TlsConfig,
 
@@ -176,6 +176,55 @@ pub fn actix_tls_server_config(settings: &Settings) -> Result<ServerConfig> {
     };
     let cert_resolver = RotatingCertificateResolver::new(tls_config, ttl)?;
     let config = config.with_cert_resolver(Arc::new(cert_resolver));
+
+    Ok(config)
+}
+
+/// Generate a rustls server configuration for gRPC (tonic) with TTL-based
+/// certificate reload.
+///
+/// Unlike the static tonic `ServerTlsConfig::identity`, this builds a rustls
+/// [`ServerConfig`] backed by [`RotatingCertificateResolver`], so the server
+/// certificate is re-read from disk after `cert_ttl` seconds without a
+/// restart. ALPN is set to `h2` as expected by gRPC/tonic.
+///
+/// `verify_client` controls whether client certificates are required and
+/// validated against the configured CA (used for internal P2P gRPC). External
+/// gRPC normally does not verify client certificates.
+pub fn grpc_tls_server_config(settings: &Settings, verify_client: bool) -> Result<ServerConfig> {
+    let builder = ServerConfig::builder();
+    let tls_config = settings
+        .tls
+        .clone()
+        .ok_or_else(Settings::tls_config_is_undefined_error)
+        .map_err(Error::Io)?;
+
+    // Verify client CA or not
+    let config = if verify_client {
+        let mut root_cert_store = RootCertStore::empty();
+
+        let ca_cert_path = tls_config.ca_cert.as_ref().ok_or(Error::NoCaCert)?;
+        let ca_certs: Vec<CertificateDer> =
+            with_buf_read(ca_cert_path, |rd| rustls_pemfile::certs(rd).collect())?;
+        root_cert_store.add_parsable_certificates(ca_certs);
+        let client_cert_verifier = WebPkiClientVerifier::builder(root_cert_store.into())
+            .build()
+            .map_err(Error::ClientCertVerifier)?;
+        builder.with_client_cert_verifier(client_cert_verifier)
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    // Configure rotating certificate resolver (same as actix/HTTP).
+    let ttl = match tls_config.cert_ttl {
+        None | Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+    };
+    let cert_resolver = RotatingCertificateResolver::new(tls_config, ttl)?;
+    let mut config = config.with_cert_resolver(Arc::new(cert_resolver));
+
+    // gRPC (HTTP/2) requires ALPN "h2".
+    config.alpn_protocols.push(b"h2".to_vec());
 
     Ok(config)
 }

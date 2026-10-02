@@ -1,7 +1,7 @@
 pub mod actix_telemetry;
 pub mod api;
 mod auth;
-mod certificate_helpers;
+pub mod certificate_helpers;
 mod forwarded;
 pub mod helpers;
 pub mod metrics_service;

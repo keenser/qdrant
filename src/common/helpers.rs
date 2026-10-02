@@ -1,7 +1,7 @@
 use std::io;
 
 use fs_err as fs;
-use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 use crate::settings::{Settings, TlsConfig};
 
@@ -17,18 +17,6 @@ pub fn load_tls_client_config(settings: &Settings) -> io::Result<Option<ClientTl
     } else {
         Ok(None)
     }
-}
-
-/// Load server TLS configuration for external gRPC
-pub fn load_tls_external_server_config(tls_config: &TlsConfig) -> io::Result<ServerTlsConfig> {
-    Ok(ServerTlsConfig::new().identity(load_identity(tls_config)?))
-}
-
-/// Load server TLS configuration for internal gRPC, check client certificate against CA
-pub fn load_tls_internal_server_config(tls_config: &TlsConfig) -> io::Result<ServerTlsConfig> {
-    Ok(ServerTlsConfig::new()
-        .identity(load_identity(tls_config)?)
-        .client_ca_root(load_ca_certificate(tls_config)?))
 }
 
 fn load_identity(tls_config: &TlsConfig) -> io::Result<Identity> {

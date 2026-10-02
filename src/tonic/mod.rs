@@ -37,6 +37,7 @@ use tonic::codec::CompressionEncoding;
 use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
+use crate::actix::certificate_helpers;
 use crate::common::auth::AuthKeys;
 use crate::common::helpers;
 use crate::common::http_client::HttpClient;
@@ -146,9 +147,18 @@ pub fn init(
             .http2_max_pending_accept_reset_streams(Some(1024));
 
         if settings.service.enable_tls {
-            log::info!("TLS enabled for gRPC API (TTL not supported)");
+            let ttl_desc = settings
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.cert_ttl)
+                .filter(|&ttl| ttl > 0)
+                .map(|ttl| format!("TTL {ttl}s"))
+                .unwrap_or_else(|| "static".to_string());
+            log::info!("TLS enabled for gRPC API ({ttl_desc})");
 
-            let tls_server_config = helpers::load_tls_external_server_config(settings.tls()?)?;
+            let rustls_config = certificate_helpers::grpc_tls_server_config(&settings, false)
+                .map_err(std::io::Error::other)?;
+            let tls_server_config = ServerTlsConfig::new().server_config(rustls_config);
 
             server = server
                 .tls_config(tls_server_config)
@@ -293,7 +303,7 @@ pub fn init_internal(
                 .http2_max_pending_accept_reset_streams(Some(1024));
 
             if let Some(config) = tls_config {
-                log::info!("TLS enabled for internal gRPC API (TTL not supported)");
+                log::info!("TLS enabled for internal gRPC API (TTL based cert reload)");
 
                 server = server.tls_config(config)?;
             } else {

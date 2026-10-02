@@ -240,12 +240,12 @@ impl Consensus {
             })?;
 
         let server_tls = if settings.cluster.p2p.enable_tls {
-            let tls_config = settings
-                .tls
-                .clone()
-                .ok_or_else(Settings::tls_config_is_undefined_error)?;
+            // Build a rustls ServerConfig with TTL-based certificate reload and
+            // client-certificate verification against the configured CA.
+            let rustls_config =
+                crate::actix::certificate_helpers::grpc_tls_server_config(&settings, true)?;
 
-            Some(helpers::load_tls_internal_server_config(&tls_config)?)
+            Some(tonic::transport::ServerTlsConfig::new().server_config(rustls_config))
         } else {
             None
         };
