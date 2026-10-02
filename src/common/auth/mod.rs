@@ -15,11 +15,13 @@ use storage::content_manager::toc::TableOfContent;
 use storage::rbac::Access;
 
 use self::claims::{Claims, ValueExists};
+use self::iam::{IamClient, IamError};
 use self::jwt_parser::JwtParser;
 use super::strings::ct_eq;
 use crate::common::inference::api_keys::InferenceToken;
 use crate::settings::ServiceConfig;
 pub mod claims;
+pub mod iam;
 pub mod jwt_parser;
 
 // Re-export Auth and AuthType from storage crate.
@@ -43,6 +45,9 @@ pub struct AuthKeys {
 
     /// Alternative JWT parser, based on the alt_read_write key
     alt_jwt_parser: Option<JwtParser>,
+
+    /// Spirit IAM opaque token introspection client
+    iam: Option<IamClient>,
 
     /// Table of content, needed to do stateful validation of JWT
     toc: Arc<TableOfContent>,
@@ -118,10 +123,12 @@ impl AuthKeys {
             non_empty(service_config.api_key.clone()),
             non_empty(service_config.alt_api_key.clone()),
             non_empty(service_config.read_only_api_key.clone()),
+            service_config.iam.clone(),
         ) {
-            (None, None, None) => None,
-            (read_write, alt_read_write, read_only) => {
+            (None, None, None, None) => None,
+            (read_write, alt_read_write, read_only, iam) => {
                 let (jwt_parser, alt_jwt_parser) = Self::get_jwt_parser(service_config);
+                let iam = iam.map(|config| IamClient::new(&config));
 
                 Some(Self {
                     read_write,
@@ -129,6 +136,7 @@ impl AuthKeys {
                     read_only,
                     jwt_parser,
                     alt_jwt_parser,
+                    iam,
                     toc,
                 })
             }
@@ -208,12 +216,52 @@ impl AuthKeys {
             return Ok((access, InferenceToken(sub), AuthType::Jwt, subject));
         }
 
-        // JTW parser exists, but can't decode the token
+        // JWT parser exists, but can't decode the token
         if let Some(error) = errors.into_iter().next() {
             return Err(error);
         }
 
-        // No JTW parser configured
+        // The token is not a local API key and not a decodable JWT. If a Spirit
+        // IAM client is configured, treat the token as an opaque bearer token and
+        // introspect it against the IAM `/oauth2/introspect` endpoint.
+        if let Some(iam) = &self.iam {
+            match iam.validate(key).await {
+                Ok(access) => {
+                    if blacklist_matches {
+                        return Err(AuthError::Forbidden(
+                            "This path is blacklisted by config".to_string(),
+                        ));
+                    }
+                    return Ok((
+                        access,
+                        InferenceToken(None),
+                        AuthType::OpaqueToken,
+                        None,
+                    ));
+                }
+                Err(IamError::Inactive) | Err(IamError::UntrustedAudience) => {
+                    return Err(AuthError::Unauthorized(
+                        "Invalid opaque token".to_string(),
+                    ));
+                }
+                Err(IamError::Request(msg)) => {
+                    return Err(AuthError::StorageError(StorageError::service_error(
+                        format!("Failed to introspect opaque token: {msg}"),
+                    )));
+                }
+                Err(IamError::UnexpectedStatus(code)) => {
+                    return Err(AuthError::StorageError(StorageError::service_error(
+                        format!("Opaque token introspection failed with status {code}"),
+                    )));
+                }
+                Err(IamError::MalformedResponse(msg)) => {
+                    return Err(AuthError::StorageError(StorageError::service_error(
+                        format!("Opaque token introspection returned a malformed response: {msg}"),
+                    )));
+                }
+            }
+        }
+
         Err(AuthError::Unauthorized(
             "Invalid API key or JWT".to_string(),
         ))
@@ -368,5 +416,70 @@ mod tests {
         let (parser, alt_parser) = AuthKeys::get_jwt_parser(&cfg);
         assert!(parser.is_some());
         assert!(alt_parser.is_none());
+    }
+
+    #[test]
+    fn iam_config_alone_enables_auth() {
+        let (toc, _dir) = test_toc();
+        let mut cfg = config(None, None, None);
+        cfg.iam = Some(crate::settings::IamConfig {
+            url: "http://localhost".to_string(),
+            client_id: "c".to_string(),
+            client_secret: "s".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        });
+        assert!(AuthKeys::try_create(&cfg, toc).is_some());
+    }
+
+    #[test]
+    fn opaque_token_falls_back_to_iam_introspection() {
+        // Create the runtime first so `TableOfContent::new` (which spins up its
+        // own runtimes) runs outside any async context, then enter it via
+        // `block_on` for the async validation call.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (toc, _dir) = test_toc();
+
+        // A mock server that answers `/oauth2/introspect` with an active token.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"active":true,"scope":"qdrant:read","client_id":"qdrant"}"#,
+            )
+            .create();
+
+        let mut cfg = config(None, None, None);
+        cfg.iam = Some(crate::settings::IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        });
+        let auth_keys = AuthKeys::try_create(&cfg, toc).unwrap();
+
+        let (access, _inference, auth_type, subject) = runtime.block_on(async {
+            auth_keys
+                .validate_request(
+                    |h| match h {
+                        "authorization" => Some("Bearer some-opaque-token"),
+                        _ => None,
+                    },
+                    false,
+                )
+                .await
+                .unwrap()
+        });
+
+        assert_eq!(auth_type, AuthType::OpaqueToken);
+        assert_eq!(subject, None);
+        // qdrant:read -> global read-only
+        assert_eq!(access, Access::full_ro("IAM scope qdrant:read"));
+        mock.assert();
     }
 }

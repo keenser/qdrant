@@ -18,6 +18,8 @@ pub use auth::Auth;
 pub enum AuthType {
     Jwt,
     ApiKey,
+    /// Opaque bearer token validated via Spirit IAM (Ory Hydra) introspection.
+    OpaqueToken,
     /// No authentication was configured or required.
     None,
     /// Request originated from the cluster itself (internal P2P communication).

@@ -1,0 +1,262 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Ory Hydra (OAuth2/OIDC server) with SQLite storage
+  # ---------------------------------------------------------------------------
+  sqlite:
+    image: busybox
+    volumes:
+      - hydra-sqlite:/mnt/sqlite
+    command: "chmod -R 777 /mnt/sqlite"
+    networks:
+      - intranet
+
+  hydra-migrate:
+    image: oryd/hydra:v26.2.0
+    depends_on:
+      sqlite:
+        condition: service_completed_successfully
+    environment:
+      DSN: sqlite:///mnt/sqlite/db.sqlite?_fk=true&mode=rwc
+    configs:
+      - source: hydra_config
+        target: /etc/config/hydra/hydra.yml
+    volumes:
+      - hydra-sqlite:/mnt/sqlite:rw
+    command: migrate -c /etc/config/hydra/hydra.yml sql up -e --yes
+    restart: on-failure
+    networks:
+      - intranet
+
+  hydra:
+    image: oryd/hydra:v26.2.0
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "4444:4444" # Public port
+      - "4445:4445" # Admin port
+    environment:
+      DSN: sqlite:///mnt/sqlite/db.sqlite?_fk=true&mode=rwc
+    configs:
+      - source: hydra_config
+        target: /etc/config/hydra/hydra.yml
+    volumes:
+      - hydra-sqlite:/mnt/sqlite:rw
+    command: serve all --dev -c /etc/config/hydra/hydra.yml
+    restart: unless-stopped
+    networks:
+      - intranet
+
+  consent:
+    image: oryd/hydra-login-consent-node:v26.2.0
+    depends_on:
+      - hydra
+    ports:
+      - "3000:3000"
+    environment:
+      HYDRA_ADMIN_URL: http://hydra:4445
+    restart: unless-stopped
+    networks:
+      - intranet
+
+  # ---------------------------------------------------------------------------
+  # Qdrant with IAM (Opaque token introspection) — two instances with distinct
+  # `audience` values so one Hydra can grant/deny access per Qdrant instance.
+  #
+  #   qdrant-a: audience = ["qdrant-a"]
+  #   qdrant-b: audience = ["qdrant-b"]
+  #
+  # A token whose introspection `aud` does not contain the instance's audience
+  # is rejected (401/403). See `IamClient::validate` in the Qdrant code.
+  # ---------------------------------------------------------------------------
+  qdrant-a:
+    image: qdrant:iam
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    container_name: qdrant-a
+    depends_on:
+      - hydra
+    ports:
+      - "6333:6333" # REST
+      - "6334:6334" # gRPC
+    expose:
+      - 6333
+      - 6334
+      - 6335
+    configs:
+      - source: qdrant_config_a
+        target: /qdrant/config/production.yaml
+    volumes:
+      - ./qdrant_data_a:/qdrant/storage
+    networks:
+      - intranet
+
+  qdrant-b:
+    image: qdrant:iam
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    container_name: qdrant-b
+    depends_on:
+      - hydra
+    ports:
+      - "6335:6333" # REST
+      - "6336:6334" # gRPC
+    expose:
+      - 6333
+      - 6334
+      - 6335
+    configs:
+      - source: qdrant_config_b
+        target: /qdrant/config/production.yaml
+    volumes:
+      - ./qdrant_data_b:/qdrant/storage
+    networks:
+      - intranet
+
+  # One-shot: create/refresh the `qdrant` OAuth2 client in Hydra. This client is
+  # used by ALL Qdrant instances to authenticate their introspection requests.
+  # Idempotent — safe to re-run.
+  hydra-client:
+    image: curlimages/curl:latest
+    depends_on:
+      - qdrant-a
+      - qdrant-b
+    networks:
+      - intranet
+    environment:
+      HYDRA_ADMIN: http://hydra:4445
+      QDRANT_CLIENT_SECRET: your_client_secret
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        CLIENT_SECRET=$${QDRANT_CLIENT_SECRET:-your_client_secret};
+        BODY="{\"client_id\":\"qdrant\",\"client_name\":\"Qdrant\",\"grant_types\":[\"client_credentials\"],\"token_endpoint_auth_method\":\"client_secret_basic\",\"scope\":\"qdrant:read qdrant:write qdrant:manage\",\"client_secret\":\"$${CLIENT_SECRET}\"}";
+        # PUT updates an existing client; if it does not exist yet (404) fall back to POST to create it.
+        CODE=$$(curl -sS -o /dev/null -w "%{http_code}" -X PUT $${HYDRA_ADMIN}/clients/qdrant -H "Content-Type: application/json" -d "$${BODY}");
+        if [ "$${CODE}" = "404" ]; then
+          curl -sS -X POST $${HYDRA_ADMIN}/clients -H "Content-Type: application/json" -d "$${BODY}" -o /dev/null -w "qdrant client create status: %{http_code}\n";
+        else
+          echo "qdrant client update status: $${CODE}";
+        fi
+
+  # Demo: demonstrates per-instance access via `audience`.
+  #
+  #   * Registers a demo client `qdrant-a-demo` that is granted audience ["qdrant-a"].
+  #   * Obtains an access token with `audience=qdrant-a`.
+  #   * Expects the token to work on qdrant-a (HTTP 200) and to be rejected on
+  #     qdrant-b (HTTP 401/403), because its `aud` lacks `qdrant-b`.
+  #
+  # Runs once on `up`; inspect the printed token/output.
+  demo:
+    image: curlimages/curl:latest
+    depends_on:
+      - hydra-client
+    networks:
+      - intranet
+    environment:
+      HYDRA_PUBLIC: http://hydra:4444
+      HYDRA_ADMIN: http://hydra:4445
+      QDRANT_A: http://qdrant-a:6333
+      QDRANT_B: http://qdrant-b:6333
+      DEMO_CLIENT_ID: qdrant-a-demo
+      DEMO_CLIENT_SECRET: demo-secret
+      DEMO_SCOPE: qdrant:read
+      DEMO_AUDIENCE: qdrant-a
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e;
+
+        # 1. Register the demo client, granted audience ["qdrant-a"].
+        BODY="{\"client_id\":\"$${DEMO_CLIENT_ID}\",\"client_name\":\"Qdrant demo\",\"grant_types\":[\"client_credentials\"],\"token_endpoint_auth_method\":\"client_secret_basic\",\"scope\":\"qdrant:read qdrant:write qdrant:manage\",\"audience\":[\"$${DEMO_AUDIENCE}\"],\"client_secret\":\"$${DEMO_CLIENT_SECRET}\"}";
+        CODE=$$(curl -sS -o /dev/null -w "%{http_code}" -X PUT $${HYDRA_ADMIN}/clients/$${DEMO_CLIENT_ID} -H "Content-Type: application/json" -d "$${BODY}");
+        if [ "$${CODE}" = "404" ]; then
+          curl -sS -X POST $${HYDRA_ADMIN}/clients -H "Content-Type: application/json" -d "$${BODY}" -o /dev/null -w "demo client create status: %{http_code}\n";
+        else
+          echo "demo client update status: $${CODE}";
+        fi
+
+        # 2. Obtain an access token with the requested scope AND audience.
+        TOKEN_JSON=$$(curl -sS -X POST $${HYDRA_PUBLIC}/oauth2/token \
+          -u "$${DEMO_CLIENT_ID}:$${DEMO_CLIENT_SECRET}" \
+          -d "grant_type=client_credentials" \
+          -d "scope=$${DEMO_SCOPE}" \
+          -d "audience=$${DEMO_AUDIENCE}");
+        TOKEN=$$(echo "$${TOKEN_JSON}" | grep -o '"access_token":"[^"]*"' | cut -d '"' -f 4);
+        if [ -z "$${TOKEN}" ]; then
+          echo "Failed to obtain access token. Response: $${TOKEN_JSON}" >&2;
+          exit 1;
+        fi;
+        echo "Got access_token: $${TOKEN}";
+        echo "Token audience: $${DEMO_AUDIENCE}";
+        echo "";
+
+        # 3. Expected: token with aud=[qdrant-a] works on qdrant-a ...
+        echo "== GET /collections on qdrant-a (aud contains $${DEMO_AUDIENCE}) ==";
+        curl -sS -o /dev/null -w "HTTP %{http_code}\n" \
+          -H "Authorization: Bearer $${TOKEN}" \
+          $${QDRANT_A}/collections;
+
+        # 4. ... and is REJECTED on qdrant-b (aud lacks qdrant-b).
+        echo "== GET /collections on qdrant-b (aud lacks qdrant-b, expect 401/403) ==";
+        curl -sS -o /dev/null -w "HTTP %{http_code}\n" \
+          -H "Authorization: Bearer $${TOKEN}" \
+          $${QDRANT_B}/collections;
+        echo "";
+
+configs:
+  hydra_config:
+    content: |
+      serve:
+        cookies:
+          same_site_mode: Lax
+      urls:
+        self:
+          issuer: http://127.0.0.1:4444
+        consent: http://127.0.0.1:3000/consent
+        login: http://127.0.0.1:3000/login
+        logout: http://127.0.0.1:3000/logout
+      secrets:
+        system:
+          - youReallyNeedToChangeThis
+      oidc:
+        subject_identifiers:
+          supported_types:
+            - pairwise
+            - public
+          pairwise:
+            salt: youReallyNeedToChangeThis
+
+  qdrant_config_a:
+    content: |
+      log_level: INFO
+      service:
+        api_key: secret
+        iam:
+          # Admin endpoint of Ory Hydra (port 4445 inside the compose network).
+          url: http://hydra:4445/
+          client_id: qdrant
+          client_secret: your_client_secret
+          # This instance only accepts tokens intended for it.
+          audience: ["qdrant-a"]
+
+  qdrant_config_b:
+    content: |
+      log_level: INFO
+      service:
+        api_key: secret
+        iam:
+          url: http://hydra:4445/
+          client_id: qdrant
+          client_secret: your_client_secret
+          audience: ["qdrant-b"]
+
+volumes:
+  hydra-sqlite:
+
+networks:
+  intranet:

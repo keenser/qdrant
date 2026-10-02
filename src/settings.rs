@@ -66,6 +66,15 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub jwt_blacklist: Option<BlacklistConfig>,
 
+    /// Spirit IAM (Ory Hydra) opaque token introspection.
+    ///
+    /// When configured, Qdrant acts as a client of Spirit IAM: bearer tokens
+    /// that are not a local API key or JWT are introspected against the IAM
+    /// OAuth2 introspection endpoint (`/oauth2/introspect`). The scopes granted
+    /// to the token are mapped onto Qdrant access rights (see [`IamConfig`]).
+    #[serde(default)]
+    pub iam: Option<IamConfig>,
+
     /// Enforce API key / JWT authentication on the internal (p2p) gRPC API.
     ///
     /// The regular API key is always forwarded on internal gRPC requests, but
@@ -113,6 +122,46 @@ impl ServiceConfig {
     pub fn hardware_reporting(&self) -> bool {
         self.hardware_reporting.unwrap_or_default()
     }
+}
+
+/// Configuration for Spirit IAM (Ory Hydra) opaque token introspection.
+#[derive(Debug, Deserialize, Clone, Validate)]
+pub struct IamConfig {
+    /// Base URL of the Spirit IAM / Ory Hydra public endpoint.
+    /// Qdrant appends `/oauth2/introspect` to reach the introspection endpoint.
+    #[validate(length(min = 1))]
+    pub url: String,
+
+    /// OAuth2 client ID used to authenticate Qdrant to the introspection endpoint.
+    #[validate(length(min = 1))]
+    pub client_id: String,
+
+    /// OAuth2 client secret used to authenticate Qdrant to the introspection endpoint.
+    #[validate(length(min = 1))]
+    pub client_secret: String,
+
+    /// How long an introspection result is cached (in seconds). Defaults to 300.
+    #[serde(default = "default_iam_cache_ttl_sec")]
+    #[validate(range(min = 1))]
+    pub cache_ttl_sec: u64,
+
+    /// Trusted token audiences. If non-empty, an introspection result whose
+    /// `aud` does not intersect this list is rejected.
+    #[serde(default)]
+    pub audience: Vec<String>,
+
+    /// Optional request timeout in seconds. Defaults to 5.
+    #[serde(default = "default_iam_timeout_sec")]
+    #[validate(range(min = 1))]
+    pub timeout_sec: u64,
+}
+
+fn default_iam_cache_ttl_sec() -> u64 {
+    300
+}
+
+fn default_iam_timeout_sec() -> u64 {
+    5
 }
 
 #[derive(Debug, Deserialize, Clone)]

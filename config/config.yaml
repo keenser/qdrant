@@ -391,6 +391,29 @@ service:
   #
   # jwt_rbac: true
 
+  # Configure Spirit IAM (Ory Hydra) opaque token introspection.
+  # When set, Qdrant validates opaque bearer tokens against the IAM OAuth2
+  # introspection endpoint (`/oauth2/introspect`) and maps the granted scopes
+  # onto Qdrant access rights:
+  #   - `qdrant:manage`  -> global read/write (manage) access
+  #   - `qdrant:read`    -> global read-only access
+  #   - `qdrant:rw`      -> read/write access to all collections
+  #   - `qdrant:r`       -> read-only access to all collections
+  #   - `qdrant:<collection>:rw` -> read/write access to a specific collection
+  #   - `qdrant:<collection>:r`  -> read-only access to a specific collection
+  #
+  # Uncomment to enable.
+  # iam:
+  #   url: https://iam.example.com
+  #   client_id: qdrant
+  #   client_secret: your_client_secret
+  #   # Optional introspection result cache TTL in seconds (default: 300)
+  #   cache_ttl_sec: 300
+  #   # Optional trusted audiences. If set, the token must contain one of these.
+  #   audience: ["qdrant"]
+  #   # Optional request timeout in seconds (default: 5)
+  #   timeout_sec: 5
+
   # Enforce API key / JWT authentication on the internal (p2p) gRPC API.
   # The regular api_key is always forwarded on internal requests, but the
   # receiving side only verifies it when this flag is enabled. Keep disabled
