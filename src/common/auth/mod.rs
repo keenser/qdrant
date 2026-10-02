@@ -232,17 +232,10 @@ impl AuthKeys {
                             "This path is blacklisted by config".to_string(),
                         ));
                     }
-                    return Ok((
-                        access,
-                        InferenceToken(None),
-                        AuthType::OpaqueToken,
-                        None,
-                    ));
+                    return Ok((access, InferenceToken(None), AuthType::OpaqueToken, None));
                 }
                 Err(IamError::Inactive) | Err(IamError::UntrustedAudience) => {
-                    return Err(AuthError::Unauthorized(
-                        "Invalid opaque token".to_string(),
-                    ));
+                    return Err(AuthError::Unauthorized("Invalid opaque token".to_string()));
                 }
                 Err(IamError::Request(msg)) => {
                     return Err(AuthError::StorageError(StorageError::service_error(
@@ -447,9 +440,7 @@ mod tests {
             .mock("POST", "/oauth2/introspect")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"active":true,"scope":"qdrant:read","client_id":"qdrant"}"#,
-            )
+            .with_body(r#"{"active":true,"scope":"qdrant:read","client_id":"qdrant"}"#)
             .create();
 
         let mut cfg = config(None, None, None);

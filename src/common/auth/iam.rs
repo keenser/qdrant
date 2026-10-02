@@ -212,9 +212,7 @@ impl IamClient {
 
         if !self.inner.audience.is_empty() {
             let granted = result.aud.as_deref().unwrap_or_default();
-            let trusted = granted
-                .iter()
-                .any(|aud| self.inner.audience.contains(aud));
+            let trusted = granted.iter().any(|aud| self.inner.audience.contains(aud));
             if !trusted {
                 return Err(IamError::UntrustedAudience);
             }
@@ -224,10 +222,7 @@ impl IamClient {
     }
 
     async fn introspect_remote(&self, token: &str) -> Result<IntrospectionResult, IamError> {
-        let body = urlencoded(&[
-            ("token", token),
-            ("token_type_hint", "access_token"),
-        ]);
+        let body = urlencoded(&[("token", token), ("token_type_hint", "access_token")]);
 
         let response = self
             .inner
@@ -385,7 +380,10 @@ mod tests {
 
     #[test]
     fn no_recognized_scope_returns_none() {
-        let scopes = ["openid", "offline"].into_iter().map(str::to_owned).collect();
+        let scopes = ["openid", "offline"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         assert_eq!(access_from_scopes(&scopes), None);
     }
 
@@ -479,9 +477,7 @@ mod tests {
             .mock("POST", "/oauth2/introspect")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"active":true,"scope":"qdrant:read","aud":["other-service"]}"#,
-            )
+            .with_body(r#"{"active":true,"scope":"qdrant:read","aud":["other-service"]}"#)
             .create_async()
             .await;
 
