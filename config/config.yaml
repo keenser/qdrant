@@ -510,3 +510,7 @@ tls:
 #   # WARNING: Enabling this without a trusted proxy allows clients to spoof their IP.
 #   # Default: false
 #   trust_forwarded_headers: false
+#   # Where audit entries are written: "file" (default, rotating files in `dir`)
+#   # or "stdout" (JSON lines to standard output).
+#   # Default: file
+#   output: file

@@ -243,6 +243,9 @@ configs:
           client_secret: your_client_secret
           # This instance only accepts tokens intended for it.
           audience: ["qdrant-a"]
+      audit:
+        enabled: true
+        output: stdout
 
   qdrant_config_b:
     content: |
@@ -254,6 +257,9 @@ configs:
           client_id: qdrant
           client_secret: your_client_secret
           audience: ["qdrant-b"]
+      audit:
+        enabled: true
+        output: stdout
 
 volumes:
   hydra-sqlite:

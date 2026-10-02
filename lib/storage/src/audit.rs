@@ -77,6 +77,10 @@ pub struct AuditConfig {
     /// to the internal operation name.  Default: true.
     #[serde(default = "default_log_api")]
     pub log_api: bool,
+
+    /// Where audit entries are written: rotating files (default) or stdout.
+    #[serde(default)]
+    pub output: AuditOutput,
 }
 
 fn default_audit_dir() -> PathBuf {
@@ -97,6 +101,17 @@ pub enum AuditRotation {
     #[default]
     Daily,
     Hourly,
+}
+
+/// Where audit log entries are written.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutput {
+    /// Rotating files in the configured audit directory (default).
+    #[default]
+    File,
+    /// Write entries to standard output, one JSON object per line.
+    Stdout,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,28 +177,40 @@ impl AuditLogger {
             max_log_files,
             trust_forwarded_headers: _,
             log_api: _,
+            output,
         } = config;
 
-        fs_err::create_dir_all(dir)?;
+        let (non_blocking, guard): (NonBlocking, WorkerGuard) = match output {
+            AuditOutput::Stdout => {
+                // Write audit entries to stdout as JSON lines. Handy for
+                // containerized setups where stdout is collected by the
+                // orchestrator instead of local rotating files.
+                tracing_appender::non_blocking(std::io::stdout())
+            }
+            AuditOutput::File => {
+                fs_err::create_dir_all(dir)?;
 
-        let rotation = match rotation {
-            AuditRotation::Daily => Rotation::DAILY,
-            AuditRotation::Hourly => Rotation::HOURLY,
+                let rotation = match rotation {
+                    AuditRotation::Daily => Rotation::DAILY,
+                    AuditRotation::Hourly => Rotation::HOURLY,
+                };
+
+                let appender = RollingFileAppender::builder()
+                    .rotation(rotation)
+                    .filename_prefix("audit")
+                    .filename_suffix("log")
+                    .max_log_files((*max_log_files).max(1))
+                    .build(dir)
+                    .map_err(|err| anyhow::anyhow!("Failed to create audit log appender: {err}"))?;
+
+                // Wrap the appender in a non-blocking writer.  The actual file
+                // I/O is performed by a dedicated worker thread.  The returned
+                // `WorkerGuard` **must** be kept alive for the lifetime of the
+                // program – dropping it flushes remaining buffered events and
+                // shuts down the worker thread.
+                tracing_appender::non_blocking(appender)
+            }
         };
-
-        let appender = RollingFileAppender::builder()
-            .rotation(rotation)
-            .filename_prefix("audit")
-            .filename_suffix("log")
-            .max_log_files((*max_log_files).max(1))
-            .build(dir)
-            .map_err(|err| anyhow::anyhow!("Failed to create audit log appender: {err}"))?;
-
-        // Wrap the appender in a non-blocking writer.  The actual file I/O is
-        // performed by a dedicated worker thread.  The returned `WorkerGuard`
-        // **must** be kept alive for the lifetime of the program – dropping it
-        // flushes remaining buffered events and shuts down the worker thread.
-        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
 
         Ok((
             Self {
@@ -236,6 +263,7 @@ pub fn init_audit_logger(config: Option<&AuditConfig>) -> anyhow::Result<Option<
         max_log_files: _,
         trust_forwarded_headers,
         log_api,
+        output,
     } = config;
 
     if !enabled {
@@ -252,7 +280,10 @@ pub fn init_audit_logger(config: Option<&AuditConfig>) -> anyhow::Result<Option<
         .set(logger)
         .map_err(|_| anyhow::anyhow!("Audit logger already initialised"))?;
 
-    log::info!("Audit logging enabled, writing to {}", dir.display());
+    match output {
+        AuditOutput::Stdout => log::info!("Audit logging enabled, writing to stdout"),
+        AuditOutput::File => log::info!("Audit logging enabled, writing to {}", dir.display()),
+    }
 
     Ok(Some(guard))
 }
