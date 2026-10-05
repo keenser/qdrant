@@ -70,12 +70,52 @@ impl Display for AuthError {
     }
 }
 
+/// A denied authentication attempt, together with whatever identity could be
+/// recovered from the request before it was denied.
+///
+/// Returned by [`AuthKeys::validate_request`] on failure so that REST/gRPC
+/// middlewares can pass the actual credential kind and subject into
+/// [`log_denied_auth`], instead of always logging the denial as anonymous.
+#[derive(Debug)]
+pub struct AuthDenial {
+    pub error: AuthError,
+    /// The credential kind the request carried, when it could be classified
+    /// before the denial (e.g. the request decoded as a JWT, or was
+    /// introspected as an opaque token). `None` when no credential was
+    /// presented, or its kind could not be determined.
+    pub auth_type: Option<AuthType>,
+    /// The identity recovered before denial, if any (e.g. an opaque token's
+    /// `sub`/`client_id`, or a JWT's `subject` claim).
+    pub subject: Option<String>,
+}
+
+impl From<AuthError> for AuthDenial {
+    /// Wrap an [`AuthError`] with no recovered identity context.
+    fn from(error: AuthError) -> Self {
+        Self {
+            error,
+            auth_type: None,
+            subject: None,
+        }
+    }
+}
+
 /// Log a denied authentication attempt to the audit log when audit is enabled.
 /// Used by both REST (actix) and gRPC (tonic) auth middlewares.
+///
+/// `auth_type` is the credential kind the request actually carried, when it
+/// could be determined (`ApiKey`, `Jwt`, `OpaqueToken`). It is `None` for
+/// requests that presented no credential at all, or whose credential could not
+/// be classified.
+///
+/// `subject` carries the identity that was recovered before the denial, if any:
+/// for opaque tokens, the OAuth2 `client_id` from introspection.
 pub fn log_denied_auth(
     api: &str,
     remote: Option<String>,
     tracing_id: Option<String>,
+    auth_type: Option<AuthType>,
+    subject: Option<String>,
     error: &AuthError,
 ) {
     if is_audit_enabled() {
@@ -83,8 +123,8 @@ pub fn log_denied_auth(
             timestamp: Utc::now(),
             method: None,
             api: Some(api.to_string()),
-            auth_type: AuthType::None,
-            subject: None,
+            auth_type: auth_type.unwrap_or(AuthType::None),
+            subject,
             remote,
             collection: None,
             tracing_id,
@@ -145,18 +185,21 @@ impl AuthKeys {
 
     /// Validate that the specified request is allowed for given keys.
     ///
-    /// Returns `(Access, InferenceToken, AuthType, Option<subject>)`.
+    /// Returns `(Access, InferenceToken, AuthType, Option<subject>)` on success,
+    /// or an [`AuthDenial`] carrying whatever credential kind/identity could be
+    /// recovered before the request was denied.
     pub async fn validate_request<'a>(
         &self,
         get_header: impl Fn(&'a str) -> Option<&'a str>,
         blacklist_matches: bool,
-    ) -> Result<(Access, InferenceToken, AuthType, Option<String>), AuthError> {
+    ) -> Result<(Access, InferenceToken, AuthType, Option<String>), AuthDenial> {
         let Some(key) = get_header(HTTP_HEADER_API_KEY)
             .or_else(|| get_header("authorization").and_then(|v| v.strip_prefix("Bearer ")))
         else {
             return Err(AuthError::Unauthorized(
                 "Must provide an API key or an Authorization bearer token".to_string(),
-            ));
+            )
+            .into());
         };
 
         if self.can_write(key) {
@@ -204,13 +247,20 @@ impl AuthKeys {
                     .map(|token| RoutingToken::from_bytes(token.as_bytes()));
 
                 self.validate_value_exists(&value_exists, routing_token)
-                    .await?;
+                    .await
+                    .map_err(|error| AuthDenial {
+                        error,
+                        auth_type: Some(AuthType::Jwt),
+                        subject: subject.clone(),
+                    })?;
             }
 
             if blacklist_matches {
-                return Err(AuthError::Forbidden(
-                    "This path is blacklisted by config".to_string(),
-                ));
+                return Err(AuthDenial {
+                    error: AuthError::Forbidden("This path is blacklisted by config".to_string()),
+                    auth_type: Some(AuthType::Jwt),
+                    subject,
+                });
             }
 
             return Ok((access, InferenceToken(sub), AuthType::Jwt, subject));
@@ -218,7 +268,11 @@ impl AuthKeys {
 
         // JWT parser exists, but can't decode the token
         if let Some(error) = errors.into_iter().next() {
-            return Err(error);
+            return Err(AuthDenial {
+                error,
+                auth_type: Some(AuthType::Jwt),
+                subject: None,
+            });
         }
 
         // The token is not a local API key and not a decodable JWT. If a Spirit
@@ -227,41 +281,71 @@ impl AuthKeys {
         if let Some(iam) = &self.iam {
             match iam.validate(key).await {
                 Ok((access, identity)) => {
+                    // Attribute the request to the resource owner (`sub`) when
+                    // the token carries one, so per-user actions are
+                    // distinguishable in the audit log; fall back to the OAuth2
+                    // client that owns the token for client-credentials flows.
+                    let subject = identity.sub.or(identity.client_id);
+
                     if blacklist_matches {
-                        return Err(AuthError::Forbidden(
-                            "This path is blacklisted by config".to_string(),
-                        ));
+                        return Err(AuthDenial {
+                            error: AuthError::Forbidden(
+                                "This path is blacklisted by config".to_string(),
+                            ),
+                            auth_type: Some(AuthType::OpaqueToken),
+                            subject,
+                        });
                     }
-                    // Log the OAuth2 client that owns the token as the audit
-                    // subject, so every DB operation performed with this opaque
-                    // token is attributable to a specific client_id.
-                    let subject = Some(identity.client_id);
+
                     return Ok((access, InferenceToken(None), AuthType::OpaqueToken, subject));
                 }
-                Err(IamError::Inactive) | Err(IamError::UntrustedAudience) => {
-                    return Err(AuthError::Unauthorized("Invalid opaque token".to_string()));
+                Err(IamError::Inactive) => {
+                    return Err(AuthDenial {
+                        error: AuthError::Unauthorized("Opaque token is not active".to_string()),
+                        auth_type: Some(AuthType::OpaqueToken),
+                        subject: None,
+                    });
+                }
+                Err(IamError::UntrustedAudience) => {
+                    return Err(AuthDenial {
+                        error: AuthError::Unauthorized(
+                            "Opaque token audience is not trusted".to_string(),
+                        ),
+                        auth_type: Some(AuthType::OpaqueToken),
+                        subject: None,
+                    });
+                }
+                Err(IamError::NoScope) => {
+                    return Err(AuthDenial {
+                        error: AuthError::Forbidden(
+                            "Opaque token grants no recognized Qdrant scope".to_string(),
+                        ),
+                        auth_type: Some(AuthType::OpaqueToken),
+                        subject: None,
+                    });
                 }
                 Err(IamError::Request(msg)) => {
-                    return Err(AuthError::StorageError(StorageError::service_error(
-                        format!("Failed to introspect opaque token: {msg}"),
-                    )));
+                    return Err(AuthError::StorageError(StorageError::service_error(format!(
+                        "Failed to introspect opaque token: {msg}"
+                    )))
+                    .into());
                 }
                 Err(IamError::UnexpectedStatus(code)) => {
-                    return Err(AuthError::StorageError(StorageError::service_error(
-                        format!("Opaque token introspection failed with status {code}"),
-                    )));
+                    return Err(AuthError::StorageError(StorageError::service_error(format!(
+                        "Opaque token introspection failed with status {code}"
+                    )))
+                    .into());
                 }
                 Err(IamError::MalformedResponse(msg)) => {
-                    return Err(AuthError::StorageError(StorageError::service_error(
-                        format!("Opaque token introspection returned a malformed response: {msg}"),
-                    )));
+                    return Err(AuthError::StorageError(StorageError::service_error(format!(
+                        "Opaque token introspection returned a malformed response: {msg}"
+                    )))
+                    .into());
                 }
             }
         }
 
-        Err(AuthError::Unauthorized(
-            "Invalid API key or JWT".to_string(),
-        ))
+        Err(AuthError::Unauthorized("Invalid API key or JWT".to_string()).into())
     }
 
     async fn validate_value_exists(
@@ -472,10 +556,101 @@ mod tests {
         });
 
         assert_eq!(auth_type, AuthType::OpaqueToken);
-        // The OAuth2 client_id from the introspection is used as the audit subject.
+        // The OAuth2 client_id from the introspection is used as the audit
+        // subject when the token carries no resource owner (`sub`).
         assert_eq!(subject.as_deref(), Some("qdrant"));
         // qdrant:read -> global read-only
         assert_eq!(access, Access::full_ro("IAM scope qdrant:read"));
+        mock.assert();
+    }
+
+    #[test]
+    fn opaque_token_subject_prefers_sub_over_client_id() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (toc, _dir) = test_toc();
+
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"active":true,"scope":"qdrant:read","client_id":"qdrant","sub":"user-42"}"#,
+            )
+            .create();
+
+        let mut cfg = config(None, None, None);
+        cfg.iam = Some(crate::settings::IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        });
+        let auth_keys = AuthKeys::try_create(&cfg, toc).unwrap();
+
+        let (_access, _inference, auth_type, subject) = runtime.block_on(async {
+            auth_keys
+                .validate_request(
+                    |h| match h {
+                        "authorization" => Some("Bearer some-opaque-token"),
+                        _ => None,
+                    },
+                    false,
+                )
+                .await
+                .unwrap()
+        });
+
+        assert_eq!(auth_type, AuthType::OpaqueToken);
+        assert_eq!(subject.as_deref(), Some("user-42"));
+        mock.assert();
+    }
+
+    #[test]
+    fn denied_opaque_token_reports_opaque_auth_type() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (toc, _dir) = test_toc();
+
+        // Active token whose audience is not trusted.
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"active":true,"scope":"qdrant:read","aud":["other-service"]}"#)
+            .create();
+
+        let mut cfg = config(None, None, None);
+        cfg.iam = Some(crate::settings::IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec!["qdrant".to_string()],
+            timeout_sec: 5,
+        });
+        let auth_keys = AuthKeys::try_create(&cfg, toc).unwrap();
+
+        let denial = runtime
+            .block_on(async {
+                auth_keys
+                    .validate_request(
+                        |h| match h {
+                            "authorization" => Some("Bearer some-opaque-token"),
+                            _ => None,
+                        },
+                        false,
+                    )
+                    .await
+            })
+            .unwrap_err();
+
+        // The denial must be attributed to the opaque-token credential kind,
+        // not to the anonymous `None`.
+        assert_eq!(denial.auth_type, Some(AuthType::OpaqueToken));
+        assert!(matches!(denial.error, AuthError::Unauthorized(_)));
         mock.assert();
     }
 }

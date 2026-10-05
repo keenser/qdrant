@@ -76,9 +76,16 @@ where
             Default::default(),
         )
         .await
-        .map_err(|e| {
-            log_denied_auth(path, remote.clone(), tracing_id.clone(), &e);
-            match e {
+        .map_err(|denial| {
+            log_denied_auth(
+                path,
+                remote.clone(),
+                tracing_id.clone(),
+                denial.auth_type,
+                denial.subject,
+                &denial.error,
+            );
+            match denial.error {
                 AuthError::Unauthorized(e) => Status::unauthenticated(e),
                 AuthError::Forbidden(e) => Status::permission_denied(e),
                 AuthError::StorageError(e) => Status::from(e),

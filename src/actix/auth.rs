@@ -301,9 +301,16 @@ where
                     );
                     service.call(req).await
                 }
-                Err(e) => {
-                    log_denied_auth(req.path(), remote.clone(), tracing_id, &e);
-                    let resp = match e {
+                Err(denial) => {
+                    log_denied_auth(
+                        req.path(),
+                        remote.clone(),
+                        tracing_id,
+                        denial.auth_type,
+                        denial.subject,
+                        &denial.error,
+                    );
+                    let resp = match denial.error {
                         AuthError::Unauthorized(e) => HttpResponse::Unauthorized().body(e),
                         AuthError::Forbidden(e) => HttpResponse::Forbidden().body(e),
                         AuthError::StorageError(e) => HttpError::from(e).error_response(),

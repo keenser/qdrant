@@ -274,9 +274,18 @@ pub fn init_internal(
             // explicitly opts in. The API key is still forwarded unconditionally
             // on outgoing internal requests, so the cluster keeps working
             // across a rolling upgrade while `enforce_internal_auth` is false.
+            //
+            // Build the internal `AuthKeys` from local keys only (api/alt/read-only
+            // + JWT), never from `iam`: peers authenticate each other with the
+            // shared internal key, not with externally-issued opaque tokens, and
+            // treating `iam` as sufficient here would mean every p2p request
+            // that doesn't carry a matching local key falls through to an IAM
+            // introspection call to Hydra on the hot path of cluster communication.
             let internal_auth_layer = if settings.service.enforce_internal_auth.unwrap_or_default()
             {
-                AuthKeys::try_create(&settings.service, toc.clone()).map(auth::AuthLayer::new)
+                let mut local_auth_config = settings.service.clone();
+                local_auth_config.iam = None;
+                AuthKeys::try_create(&local_auth_config, toc.clone()).map(auth::AuthLayer::new)
             } else {
                 None
             };

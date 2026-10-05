@@ -60,6 +60,7 @@ colored = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
+serde_urlencoded = "0.7"
 chrono = { workspace = true }
 rand = { workspace = true }
 schemars = { workspace = true }

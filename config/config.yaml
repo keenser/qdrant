@@ -396,11 +396,19 @@ service:
   # introspection endpoint (`/oauth2/introspect`) and maps the granted scopes
   # onto Qdrant access rights:
   #   - `qdrant:manage`  -> global read/write (manage) access
-  #   - `qdrant:read`    -> global read-only access
-  #   - `qdrant:rw`      -> read/write access to all collections
-  #   - `qdrant:r`       -> read-only access to all collections
+  #   - `qdrant:read` / `qdrant:r` -> global read-only access
   #   - `qdrant:<collection>:rw` -> read/write access to a specific collection
   #   - `qdrant:<collection>:r`  -> read-only access to a specific collection
+  #
+  # There is no global read/write-without-manage scope: Qdrant's global access
+  # is read-only or manage (which also covers collection lifecycle and cluster
+  # management), so a scope has to opt in explicitly with `qdrant:manage` to
+  # get global write access. Per-collection scopes do support a
+  # read/write-without-manage level via `qdrant:<collection>:rw`.
+  #
+  # A positive introspection result is cached for `cache_ttl_sec`, capped by
+  # the token's own `exp` if present, so a cached entry never outlives the
+  # token itself.
   #
   # Uncomment to enable.
   # iam:

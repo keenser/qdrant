@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use storage::rbac::{
     Access, CollectionAccess, CollectionAccessList, CollectionAccessMode, GlobalAccessMode,
@@ -10,14 +10,21 @@ use tokio::sync::Mutex;
 
 use crate::settings::IamConfig;
 
+/// Hard cap on the number of cached introspection results.
+///
+/// The key is the token itself, so without a bound the map would grow with every
+/// distinct token the process ever sees. On insert we first drop expired entries
+/// and, if that is not enough, evict the entry closest to expiry.
+const CACHE_MAX_ENTRIES: usize = 10_000;
+
 /// A cached introspection result.
 ///
-/// The whole entry is stored together with the point in time it was cached, so
-/// a single `Mutex<HashMap<String, CachedIntrospection>>` gives us both the
-/// cache TTL and per-token results.
+/// The entry stores the point in time it must be considered stale, which is the
+/// earlier of the configured cache TTL and the token's own `exp`. This keeps a
+/// token from being served from the cache after Hydra would consider it expired.
 struct CachedIntrospection {
     result: IntrospectionResult,
-    cached_at: chrono::DateTime<Utc>,
+    expires_at: DateTime<Utc>,
 }
 
 /// A single opaque token introspection result, as returned by the Ory Hydra
@@ -83,8 +90,9 @@ impl IntrospectionResult {
 /// token) and, when present, the `sub` (resource owner).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IamIdentity {
-    /// The OAuth2 client that requested the token.
-    pub client_id: String,
+    /// The OAuth2 client that requested the token, if the introspection
+    /// response provided a non-empty one.
+    pub client_id: Option<String>,
     /// The resource owner subject, if provided by the token.
     pub sub: Option<String>,
 }
@@ -100,7 +108,7 @@ struct IamClientInner {
     introspection_url: String,
     client_id: String,
     client_secret: String,
-    cache_ttl: Duration,
+    cache_ttl: ChronoDuration,
     audience: HashSet<String>,
     http: reqwest::Client,
     cache: Mutex<HashMap<String, CachedIntrospection>>,
@@ -123,33 +131,9 @@ pub enum IamError {
 
     #[error("Token audience is not trusted")]
     UntrustedAudience,
-}
 
-/// Encode key/value pairs into an `application/x-www-form-urlencoded` body.
-fn urlencoded(pairs: &[(&str, &str)]) -> String {
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn percent_encode(s: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(s.len());
-    for byte in s.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => {
-                out.push('%');
-                out.push(HEX[(byte >> 4) as usize] as char);
-                out.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-        }
-    }
-    out
+    #[error("Token grants no recognized Qdrant scope")]
+    NoScope,
 }
 
 impl IamClient {
@@ -161,12 +145,18 @@ impl IamClient {
             .build()
             .expect("Failed to build IAM HTTP client");
 
+        // `config` is validated (`cache_ttl_sec >= 1`) before an `IamClient` is
+        // constructed from it in `AuthKeys::try_create`; tests that bypass that
+        // path are expected to pass a valid `cache_ttl_sec` as well.
+        let cache_ttl = ChronoDuration::try_seconds(config.cache_ttl_sec as i64)
+            .expect("cache_ttl_sec is validated to fit in i64 seconds");
+
         Self {
             inner: std::sync::Arc::new(IamClientInner {
                 introspection_url,
                 client_id: config.client_id.clone(),
                 client_secret: config.client_secret.clone(),
-                cache_ttl: Duration::from_secs(config.cache_ttl_sec),
+                cache_ttl,
                 audience: config.audience.iter().cloned().collect(),
                 http,
                 cache: Mutex::new(Default::default()),
@@ -175,16 +165,17 @@ impl IamClient {
     }
 
     /// Introspect an opaque token, using the in-memory cache when possible.
-    ///
-    /// Returns the introspection result. `None` is returned when the token is
-    /// not active or its audience is not trusted.
     pub async fn introspect(&self, token: &str) -> Result<IntrospectionResult, IamError> {
-        // Fast path: serve from cache when a non-expired entry exists.
+        let now = Utc::now();
+
+        // Fast path: serve from cache when a non-expired entry exists. The
+        // entry's `expires_at` already accounts for both the configured cache
+        // TTL and the token's own `exp`, so a token can never be served from
+        // the cache past the point Hydra itself would consider it expired.
         {
             let cache = self.inner.cache.lock().await;
             if let Some(entry) = cache.get(token)
-                && entry.cached_at + ChronoDuration::from_std(self.inner.cache_ttl).unwrap()
-                    >= Utc::now()
+                && entry.expires_at >= now
             {
                 return Ok(entry.result.clone());
             }
@@ -195,14 +186,28 @@ impl IamClient {
         // Cache only positive results; negative results are cheap to recompute
         // and may flip back to active at any moment.
         if result.active {
-            let mut cache = self.inner.cache.lock().await;
-            cache.insert(
-                token.to_string(),
-                CachedIntrospection {
-                    result: result.clone(),
-                    cached_at: Utc::now(),
-                },
-            );
+            // The cache entry must not outlive the token itself.
+            let expires_at = match result.exp {
+                Some(exp) => {
+                    let token_exp = DateTime::<Utc>::from_timestamp(exp as i64, 0).unwrap_or(now);
+                    (now + self.inner.cache_ttl).min(token_exp)
+                }
+                None => now + self.inner.cache_ttl,
+            };
+
+            // Already expired (or expiring right now) by the token's own `exp`:
+            // not worth caching at all.
+            if expires_at > now {
+                let mut cache = self.inner.cache.lock().await;
+                evict_stale_or_oldest(&mut cache, now);
+                cache.insert(
+                    token.to_string(),
+                    CachedIntrospection {
+                        result: result.clone(),
+                        expires_at,
+                    },
+                );
+            }
         }
 
         Ok(result)
@@ -229,9 +234,11 @@ impl IamClient {
             }
         }
 
-        let access = access_from_scopes(&result.scopes()).ok_or(IamError::Inactive)?;
+        let access = access_from_scopes(&result.scopes()).ok_or(IamError::NoScope)?;
         let identity = IamIdentity {
-            client_id: result.client_id.unwrap_or_default(),
+            // An empty `client_id` is not useful for audit attribution either;
+            // normalize it to `None` like every other optional identity field.
+            client_id: result.client_id.filter(|s| !s.is_empty()),
             sub: result.sub.clone(),
         };
 
@@ -239,7 +246,9 @@ impl IamClient {
     }
 
     async fn introspect_remote(&self, token: &str) -> Result<IntrospectionResult, IamError> {
-        let body = urlencoded(&[("token", token), ("token_type_hint", "access_token")]);
+        let body =
+            serde_urlencoded::to_string([("token", token), ("token_type_hint", "access_token")])
+                .map_err(|e| IamError::Request(e.to_string()))?;
 
         let response = self
             .inner
@@ -266,15 +275,41 @@ impl IamClient {
     }
 }
 
+/// Keep the introspection cache bounded.
+///
+/// First drops every entry that has already expired. If the cache is still at
+/// capacity, evicts the single entry closest to expiry to make room — cheaper
+/// than a full LRU and good enough for a cache whose entries expire on their
+/// own within minutes.
+fn evict_stale_or_oldest(cache: &mut HashMap<String, CachedIntrospection>, now: DateTime<Utc>) {
+    cache.retain(|_, entry| entry.expires_at > now);
+
+    if cache.len() >= CACHE_MAX_ENTRIES
+        && let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest_key);
+    }
+}
+
 /// Build a Qdrant [`Access`] from a set of IAM scopes.
 ///
 /// Supported scope conventions:
 /// - `qdrant:manage`                  -> global manage (full) access
 /// - `qdrant:read`                    -> global read-only access
-/// - `qdrant:rw`                      -> read/write access to all collections
-/// - `qdrant:r`                       -> read-only access to all collections
+/// - `qdrant:r`                       -> global read-only access (alias of `qdrant:read`)
 /// - `qdrant:<collection>:rw`         -> read/write access to a specific collection
 /// - `qdrant:<collection>:r`          -> read-only access to a specific collection
+///
+/// There is no global "read/write but not manage" scope: Qdrant's global access
+/// is a binary [`GlobalAccessMode::Read`]/[`GlobalAccessMode::Manage`], where
+/// `Manage` additionally covers collection lifecycle and cluster management.
+/// Granting it from a scope named `rw` would hand out far more than the name
+/// suggests, so callers must opt in with the explicit `qdrant:manage` name to
+/// get write access at the global level. Per-collection scopes do express a
+/// read/write-without-manage level via [`CollectionAccessMode::ReadWrite`].
 ///
 /// Global scopes take precedence over collection-level scopes. Collection-level
 /// scopes are accumulated into a single `Access::Collection` list. Returns
@@ -283,13 +318,7 @@ pub fn access_from_scopes(scopes: &HashSet<String>) -> Option<Access> {
     if scopes.contains("qdrant:manage") {
         return Some(Access::Global(GlobalAccessMode::Manage));
     }
-    if scopes.contains("qdrant:read") {
-        return Some(Access::Global(GlobalAccessMode::Read));
-    }
-    if scopes.contains("qdrant:rw") {
-        return Some(Access::Global(GlobalAccessMode::Manage));
-    }
-    if scopes.contains("qdrant:r") {
+    if scopes.contains("qdrant:read") || scopes.contains("qdrant:r") {
         return Some(Access::Global(GlobalAccessMode::Read));
     }
 
@@ -347,21 +376,20 @@ mod tests {
     }
 
     #[test]
-    fn rw_scope_grants_global_manage() {
-        let scopes = ["qdrant:rw"].into_iter().map(str::to_owned).collect();
-        assert_eq!(
-            access_from_scopes(&scopes),
-            Some(Access::full("IAM scope qdrant:rw"))
-        );
-    }
-
-    #[test]
     fn r_scope_grants_global_read() {
         let scopes = ["qdrant:r"].into_iter().map(str::to_owned).collect();
         assert_eq!(
             access_from_scopes(&scopes),
             Some(Access::full_ro("IAM scope qdrant:r"))
         );
+    }
+
+    #[test]
+    fn rw_scope_is_not_a_recognized_global_scope() {
+        // There is no global read/write-without-manage access level, so an
+        // IAM scope named `rw` must not be silently upgraded to `manage`.
+        let scopes = ["qdrant:rw"].into_iter().map(str::to_owned).collect();
+        assert_eq!(access_from_scopes(&scopes), None);
     }
 
     #[test]
@@ -463,10 +491,169 @@ mod tests {
             }
             _ => panic!("expected collection access"),
         }
-        assert_eq!(identity.client_id, "qdrant");
+        assert_eq!(identity.client_id.as_deref(), Some("qdrant"));
         assert_eq!(identity.sub.as_deref(), Some("user-1"));
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn empty_client_id_is_normalized_to_none() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"active":true,"client_id":"","scope":"qdrant:read"}"#)
+            .create_async()
+            .await;
+
+        let config = IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        };
+        let client = IamClient::new(&config);
+
+        let (_access, identity) = client.validate("opaque-token").await.unwrap();
+        assert_eq!(identity.client_id, None);
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn active_token_with_no_recognized_scope_is_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"active":true,"scope":"openid offline"}"#)
+            .create_async()
+            .await;
+
+        let config = IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        };
+        let client = IamClient::new(&config);
+
+        assert!(matches!(
+            client.validate("opaque-token").await,
+            Err(IamError::NoScope)
+        ));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn second_introspection_within_ttl_is_served_from_cache() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"active":true,"client_id":"qdrant","scope":"qdrant:read"}"#)
+            // Only one HTTP round-trip is expected: the second `introspect`
+            // call for the same token must be served from the cache.
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        };
+        let client = IamClient::new(&config);
+
+        let first = client.introspect("opaque-token").await.unwrap();
+        let second = client.introspect("opaque-token").await.unwrap();
+        assert_eq!(first.client_id, second.client_id);
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cache_entry_does_not_outlive_token_exp() {
+        let mut server = mockito::Server::new_async().await;
+        // The token expires in 1 second, far sooner than the 300s cache TTL.
+        let exp = (Utc::now() + ChronoDuration::seconds(1)).timestamp();
+        let mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"active":true,"client_id":"qdrant","scope":"qdrant:read","exp":{exp}}}"#
+            ))
+            // One request now, and a second one once the cache entry (capped
+            // by `exp`, not by the longer configured TTL) has gone stale.
+            .expect(2)
+            .create_async()
+            .await;
+
+        let config = IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        };
+        let client = IamClient::new(&config);
+
+        client.introspect("opaque-token").await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        client.introspect("opaque-token").await.unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cache_is_bounded_in_size() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/oauth2/introspect")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"active":true,"client_id":"qdrant","scope":"qdrant:read"}"#)
+            .expect_at_least(CACHE_MAX_ENTRIES + 1)
+            .create_async()
+            .await;
+
+        let config = IamConfig {
+            url: server.url(),
+            client_id: "qdrant".to_string(),
+            client_secret: "secret".to_string(),
+            cache_ttl_sec: 300,
+            audience: vec![],
+            timeout_sec: 5,
+        };
+        let client = IamClient::new(&config);
+
+        for i in 0..=CACHE_MAX_ENTRIES {
+            client
+                .introspect(&format!("opaque-token-{i}"))
+                .await
+                .unwrap();
+        }
+
+        let cache_len = client.inner.cache.lock().await.len();
+        assert!(
+            cache_len <= CACHE_MAX_ENTRIES,
+            "cache grew past its hard cap: {cache_len}"
+        );
     }
 
     #[tokio::test]
